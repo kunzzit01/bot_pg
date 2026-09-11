@@ -1,0 +1,21 @@
+# 机密
+.env
+*.pem
+*.key
+
+# 运行期数据（账本 / 操作员 / 快照）
+data/
+ledger_settings.json
+ledger_entries.json
+ledger_carryover.json
+ledger_clear_snapshot.json
+operators.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+*.log

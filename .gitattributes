@@ -1,0 +1,5 @@
+# shell 脚本必须保持 LF：CRLF 会让 Linux 上的 bash 报 $'\r': command not found
+*.sh text eol=lf
+
+# 容器里运行的 Python 源码同样统一 LF
+*.py text eol=lf

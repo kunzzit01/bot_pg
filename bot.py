@@ -11,6 +11,8 @@ from telegram.ext import (
 
 TOKEN = os.environ["BOT_TOKEN"]
 
+BOT_VERSION = "v1.32"
+
 ADMIN_USERNAMES = {"IgAccJohn", "Dragonball77", "MrK6776", "react249", "jiang9546"}
 
 PAGE_SIZE = 10
@@ -900,5 +902,5 @@ app.add_handler(CallbackQueryHandler(listoperators_close_cb, pattern=r"^op:close
 app.add_handler(CallbackQueryHandler(listoperators_noop_cb, pattern=r"^op:noop$"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-print("记账机器人已启动，正在监听消息...")
+print(f"记账机器人 {BOT_VERSION} 已启动，正在监听消息...")
 app.run_polling(drop_pending_updates=True)

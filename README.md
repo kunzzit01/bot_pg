@@ -46,15 +46,33 @@ python3 bot.py
 
 看到 `记账机器人已启动，正在监听消息...` 即为启动成功。之后私聊或拉进群发 `/start` 查看指令说明。
 
-## Docker 运行
+## Docker 部署
+
+首次部署：
 
 ```bash
-docker build -t bot_pg:latest .
-docker run -d --name bot_pg --restart unless-stopped \
-  --env-file .env \
-  -v "$(pwd)/data:/app/data" \
-  -e BOT_DATA_DIR=/app/data \
-  bot_pg:latest
+mkdir -p ~/newbot_pg1 && cd ~/newbot_pg1
+git clone https://github.com/kunzzit01/bot_pg.git .
+cp .env.example .env && nano .env       # 填入 BOT_TOKEN
+bash deploy/update.sh
+```
+
+以后更新代码只要一条：
+
+```bash
+cd ~/newbot_pg1 && git pull && bash deploy/update.sh
+```
+
+`deploy/update.sh` 是幂等的，可以反复执行：`git pull` → `docker build` → 删掉旧容器 → 用同样的参数重新 `docker run`。
+数据卷固定挂在仓库目录的 `data/`，重建容器不会丢账本；脚本只操作自己的容器，不会影响机器上其他容器。
+
+容器名与镜像名默认是 `newbot_pg1_container` / `newbot_pg1_image:latest`，需要改时用环境变量覆盖：
+`CONTAINER=别的名字 IMAGE=别的镜像:tag bash deploy/update.sh`。
+
+验证部署版本：
+
+```bash
+docker logs --tail 3 newbot_pg1_container     # 应显示：记账机器人 v1.32 已启动，正在监听消息...
 ```
 
 > 机器人是纯出站长轮询（`run_polling`），不监听任何端口，所以不需要 `-p` 端口映射。
@@ -76,3 +94,4 @@ docker run -d --name bot_pg --restart unless-stopped \
 
 - `bot.py` 顶部的 `ADMIN_USERNAMES` 是唯一的管理员来源，改完需要重启进程。
 - 账期由 `结束账单` / `日切` 推进；`period_start` 只在第一次记账时确定一次。
+- `bot.py` 顶部的 `BOT_VERSION` 是版本号常量，改动代码时递增，方便用 `docker logs` 核对线上跑的是哪一版。

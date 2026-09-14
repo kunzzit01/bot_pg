@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -24,14 +27,19 @@ LEDGER_ENTRIES_FILE = os.path.join(_data_dir, "ledger_entries.json")
 LEDGER_CARRYOVER_FILE = os.path.join(_data_dir, "ledger_carryover.json")
 LEDGER_CLEAR_SNAPSHOT_FILE = os.path.join(_data_dir, "ledger_clear_snapshot.json")
 OPERATORS_FILE = os.path.join(_data_dir, "operators.json")
+ADDRESS_LOG_FILE = os.path.join(_data_dir, "usdt_addresses.json")
+MY_ADDRESS_FILE = os.path.join(_data_dir, "my_address.json")
 
 DEFAULT_LEDGER_SETTINGS = {
-    "currency": "MYR",
+    "currency": "AUD",
     "period_start": None,
     "period_label": None,
     "tz_offset": 8,
     "in_fee": 0,
     "out_fee": 0,
+    "auto_cut_time": None,       # 例如 "04:00"，为 None 表示未开启自动日切
+    "auto_cut_last_date": None,  # 记录最近一次自动日切的日期，防止同一天重复触发
+    "hide_currency": False,
 }
 
 (
@@ -46,13 +54,26 @@ RE_SET_OUT_FEE = re.compile(r"^设置OUT费率\s*(-?\d+(?:\.\d+)?)$", re.IGNOREC
 RE_SET_PERIOD_LABEL = re.compile(r"^设[置疑定]日期\s*(\d{4}-\d{2}-\d{2})$")
 RE_VIEW_LEDGER_BILL = re.compile(r"^账单$")
 RE_CLOSE_LEDGER = re.compile(r"^(?:结束账单|日切)$")
+RE_SET_AUTO_CUT_TIME = re.compile(r"^设[置疑定]日切\s*(\d{1,4})(?::(\d{1,2}))?$")
+RE_CANCEL_AUTO_CUT = re.compile(r"^(?:取消日切|取消自动日切|关闭日切)$")
+RE_VIEW_AUTO_CUT = re.compile(r"^(?:日切时间|查看日切时间|查看日切)$")
 RE_LEDGER_ENTRY = re.compile(r"^([+-])\s*(\d+(?:\.\d+)?)\s*(.*)$", re.DOTALL)
+RE_LEDGER_ENTRY_TAGGED = re.compile(r"^([^\s+-]+)\s*([+-])\s*(\d+(?:\.\d+)?)\s*(.*)$", re.DOTALL)
 RE_LEDGER_DISBURSE = re.compile(r"^下发\s*([+-])?\s*(\d+(?:\.\d+)?)\s*(?:手续\s*(\d+(?:\.\d+)?)\s*)?(.*)$", re.DOTALL)
 RE_REVOKE = re.compile(r"^撤销$")
 RE_REVOKE_RESTORE = re.compile(r"^撤销恢复$")
 RE_RETRACT = re.compile(r"^回撤$")
 RE_CLEAR_LEDGER = re.compile(r"^清空账单$")
 RE_UNDO_CLEAR_LEDGER = re.compile(r"^撤销清空账单$")
+RE_USDT_ADDR = re.compile(
+    r"(?<![0-9a-fA-Fx])0x[a-fA-F0-9]{40}(?![0-9a-fA-F])"
+    r"|(?<![1-9A-HJ-NP-Za-km-z])T[1-9A-HJ-NP-Za-km-z]{33}(?![1-9A-HJ-NP-Za-km-z])"
+)
+RE_SET_MY_ADDRESS = re.compile(r"^收款地址\s*(\S+)$")
+RE_CLEAR_MY_ADDRESS = re.compile(r"^(?:设置解除地址|解除地址|清除我的地址)$")
+RE_SHOW_MY_ADDRESS = re.compile(r"^我的地址$")
+RE_HIDE_CURRENCY = re.compile(r"^隐藏货币$")
+RE_SHOW_CURRENCY = re.compile(r"^(?:显示货币|取消隐藏货币)$")
 
 CHAR_MAP = {
     "（": "(", "）": ")", "＋": "+", "－": "-",
@@ -104,6 +125,14 @@ def is_operator(user) -> bool:
         return True
     return False
 
+def load_my_address():
+    return load_json(MY_ADDRESS_FILE, {}).get("address")
+
+def save_my_address(addr):
+    save_json(MY_ADDRESS_FILE, {"address": addr})
+
+def clear_my_address():
+    save_json(MY_ADDRESS_FILE, {"address": None})
 
 # ---------- 操作员名单 ----------
 
@@ -351,6 +380,172 @@ def load_clear_snapshots():
 def save_clear_snapshots(data):
     save_json(LEDGER_CLEAR_SNAPSHOT_FILE, data)
 
+# ---------- USDT 地址查重 + TRON 钱包信息 ----------
+
+def load_address_log():
+    return load_json(ADDRESS_LOG_FILE, {})
+
+def save_address_log(data):
+    save_json(ADDRESS_LOG_FILE, data)
+
+
+TRONGRID_BASE = "https://api.trongrid.io"
+USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+# 可选：去 https://www.trongrid.io 免费注册拿一个 API Key，设置环境变量 TRON_API_KEY 之后
+# 请求会自动带上，能大幅提高免费额度；不设置也能用，只是限流会比较严格。
+TRON_API_KEY = os.environ.get("TRON_API_KEY", "69c587db-78d8-407a-88f2-0095dd45e7e7").strip()
+
+
+def _tron_headers(extra=None):
+    headers = {"Accept": "application/json"}
+    if TRON_API_KEY:
+        headers["TRON-PRO-API-KEY"] = TRON_API_KEY
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _fetch_tron_wallet_info_sync(address):
+    """同步阻塞地查 TronGrid 公共接口，放到线程池里跑，不卡住 bot 的事件循环。查询失败返回 None。"""
+    try:
+        req = urllib.request.Request(
+            f"{TRONGRID_BASE}/v1/accounts/{address}", headers=_tron_headers()
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            account_data = json.loads(resp.read().decode("utf-8"))
+
+        payload = json.dumps({"address": address, "visible": True}).encode("utf-8")
+        req2 = urllib.request.Request(
+            f"{TRONGRID_BASE}/wallet/getaccountresource",
+            data=payload,
+            headers=_tron_headers({"Content-Type": "application/json"}),
+            method="POST",
+        )
+        with urllib.request.urlopen(req2, timeout=6) as resp2:
+            resource_data = json.loads(resp2.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    data_list = account_data.get("data") or []
+    if not data_list:
+        return {"no_chain_data": True}
+    acc = data_list[0]
+
+    trx_balance = acc.get("balance", 0) / 1_000_000
+
+    usdt_balance = 0.0
+    for token in acc.get("trc20", []) or []:
+        if USDT_TRC20_CONTRACT in token:
+            usdt_balance = int(token[USDT_TRC20_CONTRACT]) / 1_000_000
+            break
+
+    owner_perm = acc.get("owner_permission") or {}
+    threshold = owner_perm.get("threshold", 1)
+    keys = owner_perm.get("keys") or []
+    is_multisig = threshold > 1 or len(keys) > 1
+
+    free_limit = resource_data.get("freeNetLimit", 0)
+    free_used = resource_data.get("freeNetUsed", 0)
+    staked_limit = resource_data.get("NetLimit", 0)
+    staked_used = resource_data.get("NetUsed", 0)
+    available_bandwidth = (free_limit - free_used) + (staked_limit - staked_used)
+
+    energy_limit = resource_data.get("EnergyLimit", 0)
+    energy_used = resource_data.get("EnergyUsed", 0)
+    available_energy = energy_limit - energy_used
+
+    return {
+        "no_chain_data": False,
+        "create_time_ms": acc.get("create_time"),
+        "available_bandwidth": available_bandwidth,
+        "available_energy": available_energy,
+        "is_multisig": is_multisig,
+        "usdt_balance": usdt_balance,
+        "trx_balance": trx_balance,
+    }
+
+
+async def fetch_tron_wallet_info(address):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _fetch_tron_wallet_info_sync, address)
+
+
+def format_tron_wallet_card(address, info, tz):
+    if info.get("create_time_ms"):
+        create_str = datetime.fromtimestamp(info["create_time_ms"] / 1000, tz).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        create_str = "未知"
+    security = "无授权多签 安全 ✅" if not info["is_multisig"] else "存在多签授权 ⚠️"
+    lines = [
+        f"🔶 <code>{address}</code>",
+        f"├创建日期：{create_str}",
+        f"├可用带宽：{info['available_bandwidth']}",
+        f"├可用能量：{info['available_energy']}",
+        f"├安全状态：{security}",
+        f"├USDT：{info['usdt_balance']:.6f}",
+        f"└TRX：{info['trx_balance']:.6f}",
+    ]
+    return "\n".join(lines)
+
+
+async def handle_usdt_addresses(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """扫描消息里的 USDT 地址（TRC20/ERC20，前后可带其他文字）。群里任何人发的消息都会检测，不限操作员。
+    1）查重：这个地址群里是否出现过，出现过就提示第一次是谁发的、什么时候发的。
+    2）钱包信息卡片：仅针对 TRC20（T开头）地址，查 TronGrid 公共接口，展示余额/资源/多签安全状态。"""
+    addresses = set(RE_USDT_ADDR.findall(text))
+    if not addresses:
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    sender_name = f"@{user.username}" if user.username else (user.full_name or str(user.id))
+    tz = get_ledger_tz(chat_id)
+    now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    log = load_address_log()
+    chat_log = log.setdefault(str(chat_id), {})
+    changed = False
+
+    for addr in addresses:
+        record = chat_log.get(addr)
+        if record is None:
+            chat_log[addr] = {
+                "first_sender_id": user.id,
+                "first_sender_name": sender_name,
+                "first_time": now_str,
+                "first_message_id": update.message.message_id,
+                "count": 1,
+            }
+            changed = True
+        else:
+            record["count"] = record.get("count", 1) + 1
+            changed = True
+            same_note = "（是同一个人）" if record.get("first_sender_id") == user.id else "（不是同一个人）"
+            await update.message.reply_text(
+                f"⚠️ 这个地址之前已经出现过 {same_note}\n"
+                f"地址：<code>{addr}</code>\n"
+                f"首次发送人：{record['first_sender_name']}\n"
+                f"首次发送时间：{record['first_time']}\n"
+                f"累计出现：{record['count']} 次",
+                parse_mode="HTML",
+            )
+
+        if addr.startswith("T"):
+            info = await fetch_tron_wallet_info(addr)
+            if info is None:
+                continue  # 查询失败（网络问题/被限流），静默跳过，不打扰群里
+            if info.get("no_chain_data"):
+                await update.message.reply_text(
+                    f"🔶 <code>{addr}</code>\n（链上暂无这个地址的数据，可能是新地址或从未上链）",
+                    parse_mode="HTML",
+                )
+                continue
+            await update.message.reply_text(
+                format_tron_wallet_card(addr, info, tz), parse_mode="HTML"
+            )
+
+    if changed:
+        save_address_log(log)
 
 def get_period_start_str(chat_id, tz):
     """当前账期起点；第一次调用时确定起点，之后只靠结束账单推进。"""
@@ -377,6 +572,23 @@ def _period_entries(chat_id):
     entries = load_ledger_entries().get(str(chat_id), [])
     period_start_str = get_period_start_str(chat_id, get_ledger_tz(chat_id))
     return [e for e in entries if e.get("time", "") >= period_start_str and not e.get("voided")]
+
+
+def get_today_group_stats(chat_id, tz):
+    """返回当前账期内，按代号（group）分组的原始金额合计，按代号第一次出现的顺序排列。
+    只统计入账/出账（+ - 记一笔）里带了代号的记录，不含下发；金额是原始输入金额，不扣费率。"""
+    totals = {}
+    order = []
+    for e in _period_entries(chat_id):
+        tag = e.get("group")
+        if not tag or e.get("type") not in ("in", "out"):
+            continue
+        if tag not in totals:
+            totals[tag] = 0.0
+            order.append(tag)
+        sign = 1 if e["type"] == "in" else -1
+        totals[tag] += sign * e["amount"]
+    return [(tag, round(totals[tag], 4)) for tag in order]
 
 
 def get_today_entries_split(chat_id, tz):
@@ -481,6 +693,62 @@ def close_ledger_day(chat_id):
     return grand_totals, next_label
 
 
+# ---------- 自动日切 ----------
+
+async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
+    """后台定时任务：每隔一段时间检查一次所有群，看是否到了该群设置的自动日切时间。
+    到点就自动执行一次「日切」（等价于手动发「日切」），并在群里发送结果。
+    用 auto_cut_last_date 记录今天是否已经切过，防止同一分钟内被多次触发，也防止重启后重复切。"""
+    all_settings = load_ledger_settings()
+    if not all_settings:
+        return
+
+    for chat_id_str, raw in list(all_settings.items()):
+        settings = dict(DEFAULT_LEDGER_SETTINGS)
+        settings.update(raw)
+
+        cut_time = settings.get("auto_cut_time")
+        if not cut_time:
+            continue
+
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            continue
+
+        tz = timezone(timedelta(hours=settings.get("tz_offset", 8)))
+        now = datetime.now(tz)
+        if now.strftime("%H:%M") != cut_time:
+            continue
+
+        today_str = now.strftime("%Y-%m-%d")
+        if settings.get("auto_cut_last_date") == today_str:
+            continue  # 今天已经切过，跳过
+
+        # 先标记，避免同一轮/并发里重复触发
+        set_group_ledger_setting(chat_id, "auto_cut_last_date", today_str)
+
+        try:
+            grand_totals, next_label = close_ledger_day(chat_id)
+        except Exception as e:
+            print(f"[auto_cut] 群 {chat_id} 自动日切失败：{e}")
+            continue
+
+        gt_str = " | ".join([f"{cur}: {_fmt_num(val)}" for cur, val in grand_totals.items()])
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⏰ 已自动日切（{cut_time}）！\n\n"
+                    f"📊 <b>结转总额</b>：<code>{gt_str}</code>\n"
+                    f"📅 <b>新账期</b>：{next_label}"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            print(f"[auto_cut] 群 {chat_id} 发送自动日切消息失败：{e}")
+
+
 # ---------- 格式化 ----------
 
 def _fmt_num(n):
@@ -499,7 +767,7 @@ def format_ledger_line(entry, is_multi=False):
     if sign == 1:
         display_net = f"+{display_net}"
 
-    line = f"<b>{time_str}</b> {display_amount} = {display_net}"
+    line = f"<code>{time_str}</code> {display_amount} = {display_net}"
     if entry.get("note"):
         line += f" · {entry['note']}"
     return line
@@ -511,7 +779,7 @@ def format_disburse_line(entry):
     display_net = _fmt_num(entry["net_amount"])
     if entry["net_amount"] > 0:
         display_net = f"+{display_net}"
-    line = f"<b>{time_str}</b> {display_amount} = {display_net}"
+    line = f"<code>{time_str}</code> {display_amount} = {display_net}"
     if entry.get("note"):
         line += f" · {entry['note']}"
     return line
@@ -520,7 +788,7 @@ def format_disburse_line(entry):
 # ---------- 账单视图 ----------
 
 def build_ledger_summary(chat_id):
-    """账单视图（图1格式）：账期 → 交易流水 → 已下发 → Deposit/Withdraw/Grand Total。"""
+    """账单视图（图1格式）：账期 → 已入账 → 已下发 → Deposit/Withdraw/Grand Total。"""
     settings = get_group_ledger_settings(chat_id)
     tz = get_ledger_tz(chat_id)
     ins, outs = get_today_entries_split(chat_id, tz)
@@ -529,8 +797,15 @@ def build_ledger_summary(chat_id):
 
     lines = [f"📅 账期：{get_period_label(chat_id, tz)}", ""]
 
+    group_stats = get_today_group_stats(chat_id, tz)
+    if group_stats:
+        lines.append(f"分组统计 ({len(group_stats)}组)")
+        for tag, total in group_stats:
+            lines.append(f"{tag} 👉 {_fmt_num(total)}")
+        lines.append("")
+
     combined = sorted(ins + outs, key=lambda e: e["time"])
-    lines.append(f"交易流水 ({len(combined)}笔)")
+    lines.append(f"已入账 ({len(combined)}笔)")
     if combined:
         lines += [format_ledger_line(e) for e in combined[-5:]]
     else:
@@ -547,10 +822,10 @@ def build_ledger_summary(chat_id):
     total_deposit = sum(deposit_totals.values())
     total_withdraw = sum(disburse_totals.values())
     total_grand = round(total_deposit + total_withdraw, 4)
-    cur = settings["currency"]
-    lines.append(f"Deposit: {_fmt_num(total_deposit)} {cur}")
-    lines.append(f"Withdraw: {_fmt_num(total_withdraw)} {cur}")
-    lines.append(f"Settlement: {_fmt_num(total_grand)} {cur}")
+    cur = "" if settings.get("hide_currency") else f" {settings['currency']}"
+    lines.append(f"Deposit: {_fmt_num(total_deposit)}{cur}")
+    lines.append(f"Withdraw: {_fmt_num(total_withdraw)}{cur}")
+    lines.append(f"Grand Total: {_fmt_num(total_grand)}{cur}")
 
     return "\n".join(lines)
 
@@ -558,12 +833,17 @@ def build_ledger_summary(chat_id):
 # ---------- 记账消息处理 ----------
 
 async def try_handle_ledger_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
-    """匹配 +金额 / -金额 记一笔，可带备注。"""
-    m = RE_LEDGER_ENTRY.match(text)
-    if not m:
-        return False
+    """匹配 +金额 / -金额 记一笔，可带备注；也支持「代号 +金额 备注」这种带分组代号的写法。"""
+    tag = None
+    m = RE_LEDGER_ENTRY_TAGGED.match(text)
+    if m and m.group(1) != "下发":
+        tag, sign, amount_str, note = m.groups()
+    else:
+        m = RE_LEDGER_ENTRY.match(text)
+        if not m:
+            return False
+        sign, amount_str, note = m.groups()
 
-    sign, amount_str, note = m.groups()
     amount = float(amount_str)
     note = note.strip()
 
@@ -584,6 +864,8 @@ async def try_handle_ledger_entry(update: Update, context: ContextTypes.DEFAULT_
         "operator_name": f"@{user.username}" if user.username else (user.full_name or str(user.id)),
         "time": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if tag:
+        entry["group"] = tag
 
     data_now = load_ledger_entries()
     entry["id"] = len(data_now.get(str(chat_id), [])) + 1
@@ -734,7 +1016,21 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
             parse_mode="HTML",
         )
         return True
-
+    if RE_HIDE_CURRENCY.match(text):
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能设置")
+            return True
+        set_group_ledger_setting(chat_id, "hide_currency", True)
+        await update.message.reply_text("✅ 已隐藏 Deposit/Withdraw/Grand Total 的货币单位")
+        return True
+    
+    if RE_SHOW_CURRENCY.match(text):
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能设置")
+            return True
+        set_group_ledger_setting(chat_id, "hide_currency", False)
+        await update.message.reply_text("✅ 已恢复显示货币单位")
+        return True
     if RE_UNDO_CLEAR_LEDGER.match(text):
         restored = undo_clear_ledger_today(chat_id)
         if restored is None:
@@ -779,7 +1075,7 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
 
     m = RE_CHANGE_CURRENCY.match(text)
     if m:
-        if not is_admin(update.effective_user):
+        if not is_operator(update.effective_user):
             await update.message.reply_text("只有管理员能修改币种")
             return True
         src, dst = m.group(1).upper(), m.group(2).upper()
@@ -819,8 +1115,88 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text(f"✅ 账期日期已校准为：{m.group(1)}")
         return True
 
+    m = RE_SET_AUTO_CUT_TIME.match(text)
+    if m:
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能设置自动日切时间")
+            return True
+        digits = m.group(1)
+        if m.group(2) is not None:
+            # 「22:30」这种带冒号的写法
+            hour, minute = int(digits), int(m.group(2))
+        elif len(digits) <= 2:
+            # 「22」只写小时
+            hour, minute = int(digits), 0
+        elif len(digits) == 3:
+            # 「930」= 9:30
+            hour, minute = int(digits[0]), int(digits[1:])
+        else:
+            # 「2230」= 22:30
+            hour, minute = int(digits[:2]), int(digits[2:])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            await update.message.reply_text("时间不对，小时是 0-23，分钟是 0-59，例如「设置日切 22」「设置日切 22:30」「设置日切 2230」")
+            return True
+        cut_time = f"{hour:02d}:{minute:02d}"
+        set_group_ledger_setting(chat_id, "auto_cut_time", cut_time)
+        # 今天如果已经过了这个时间点，标记成"今天已切过"，避免设置完马上误触发一次
+        tz = get_ledger_tz(chat_id)
+        now = datetime.now(tz)
+        if now.strftime("%H:%M") >= cut_time:
+            set_group_ledger_setting(chat_id, "auto_cut_last_date", now.strftime("%Y-%m-%d"))
+        tz_offset = get_group_ledger_settings(chat_id)["tz_offset"]
+        offset_str = f"+{tz_offset:g}" if tz_offset >= 0 else f"{tz_offset:g}"
+        await update.message.reply_text(
+            f"✅ 已开启自动日切，每天 {cut_time}（本群时区 UTC{offset_str}）会自动结束账单\n"
+            f"如需取消，发「取消日切」"
+        )
+        return True
+
+    if RE_CANCEL_AUTO_CUT.match(text):
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能取消自动日切")
+            return True
+        set_group_ledger_setting(chat_id, "auto_cut_time", None)
+        await update.message.reply_text("✅ 已取消自动日切")
+        return True
+
+    if RE_VIEW_AUTO_CUT.match(text):
+        cut_time = get_group_ledger_settings(chat_id).get("auto_cut_time")
+        if cut_time:
+            await update.message.reply_text(f"⏰ 当前自动日切时间：每天 {cut_time}")
+        else:
+            await update.message.reply_text("还没设置自动日切，发「设置日切 22」开启")
+        return True
+
     return False
 
+# ---------- 我的地址 ----------
+async def try_handle_my_address(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    m = RE_SET_MY_ADDRESS.match(text)
+    if m:
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能设置收款地址")
+            return True
+        save_my_address(m.group(1))
+        await update.message.reply_text(f"✅ 已保存收款地址：\n<code>{m.group(1)}</code>", parse_mode="HTML")
+        return True
+
+    if RE_CLEAR_MY_ADDRESS.match(text):
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能解除收款地址")
+            return True
+        clear_my_address()
+        await update.message.reply_text("✅ 已解除收款地址")
+        return True
+
+    if RE_SHOW_MY_ADDRESS.match(text):
+        addr = load_my_address()
+        if not addr:
+            await update.message.reply_text("还没设置收款地址，发「收款地址 你的地址」来保存")
+        else:
+            await update.message.reply_text(f"📮 收款地址：\n<code>{addr}</code>", parse_mode="HTML")
+        return True
+
+    return False
 
 # ---------- 回调 ----------
 
@@ -838,6 +1214,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = normalize(text)
 
+    # USDT 地址查重 + TRON 钱包信息卡片：群里任何人发的消息都检测，不限操作员
+    await handle_usdt_addresses(update, context, text)
+
     if await try_handle_ledger_settings(update, context, text):
         return
 
@@ -849,7 +1228,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await try_handle_ledger_disburse(update, context, text):
         return
-
+    
+    if await try_handle_my_address(update, context, text):
+        return
 
 async def post_init(application):
     await application.bot.set_my_commands([
@@ -866,6 +1247,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "你好！我是记账助手机器人 🧾\n\n"
         "记一笔：发 +金额 表示入账，-金额 表示出账，后面可加备注\n"
         "例如：+100 lim / -50 提现\n"
+        "分组统计：发「代号 +金额 备注」，账单会按代号自动汇总，例如：KY +50 T\n"
         "下发：发「下发 金额 [手续X] [备注]」\n"
         "查看账单：发「账单」或 /ledger\n"
         "改币种：发「设置币种 AUD」\n"
@@ -874,7 +1256,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "设IN/OUT费率：发「设置IN费率 5」/「设置OUT费率 3」（百分比，影响记账净额）\n"
         "校准账期：发「设定日期 2026-09-10」\n"
         "结束账单 / 日切 / 清空账单 / 撤销清空账单\n"
+        "自动日切：发「设置日切 22」，每天22点自动结束账单（也支持「设置日切 2230」「设置日切 22:30」）\n"
+        "查看/取消自动日切：发「日切时间」/「取消日切」\n"
         "撤销某笔：回复那条记账消息发「撤销」，恢复发「撤销恢复」\n\n"
+        "USDT地址查重：群里谁发的消息里带地址（TRC20/ERC20）都会自动检测，"  
+        "如果这个地址之前出现过，会提示是谁第一次发的、什么时候发的\n"
+        "TRON钱包信息：发TRC20地址（T开头）还会自动查该地址的创建日期、可用带宽/能量、"
+        "多签安全状态、USDT/TRX余额\n\n"      
         "（管理员专属：/addoperator /removeoperator /listoperators）"
     )
 
@@ -898,6 +1286,12 @@ app.add_handler(CallbackQueryHandler(listoperators_cancel_cb, pattern=r"^op:canc
 app.add_handler(CallbackQueryHandler(listoperators_close_cb, pattern=r"^op:close$"))
 app.add_handler(CallbackQueryHandler(listoperators_noop_cb, pattern=r"^op:noop$"))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+if app.job_queue is not None:
+    app.job_queue.run_repeating(auto_cut_job, interval=30, first=10)
+else:
+    print("⚠️ JobQueue 不可用，自动日切功能不会生效。请运行："
+          "pip install \"python-telegram-bot[job-queue]\"")
 
 print("记账机器人已启动，正在监听消息...")
 app.run_polling(drop_pending_updates=True)

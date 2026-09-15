@@ -732,8 +732,8 @@ async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, da
             disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
             period_entries = _period_entries(chat_id)
             settlement += round(sum(deposit_totals.values()) + sum(disburse_totals.values()), 4)
-            in_amount += round(sum(e["amount"] for e in period_entries if e["type"] == "in"), 4)
-            out_amount += round(sum(e["amount"] for e in disburse_items), 4)
+            in_amount += round(sum(deposit_totals.values()), 4)
+            out_amount += round(-sum(disburse_totals.values()), 4)
             count += len(period_entries)
             status_parts.append("未结算")
 
@@ -902,8 +902,11 @@ def close_ledger_day(chat_id):
 
     period_entries = _period_entries(chat_id)
     total_count = len(period_entries)
-    total_in_amount = round(sum(e["amount"] for e in period_entries if e["type"] == "in"), 4)
-    total_out_amount = round(sum(e["amount"] for e in disburse_items), 4)
+    # 总进/总出改为跟 Deposit/Withdraw 同一套口径：
+    # 总进 = "+"记一笔 - "-"记一笔（净额，即 deposit_totals 之和）
+    # 总出 = 下发净额（已扣手续费、冲正已反向计入）取正数，即 -disburse_totals 之和
+    total_in_amount = round(sum(deposit_totals.values()), 4)
+    total_out_amount = round(-sum(disburse_totals.values()), 4)
 
     label = get_period_label(chat_id, tz)
 
@@ -959,9 +962,11 @@ def get_today_group_in_out(chat_id, tz):
         base_in = 0.0
         base_out = 0.0
 
-    period_entries = _period_entries(chat_id)
-    live_in = sum(e["amount"] for e in period_entries if e["type"] == "in")
-    live_out = sum(e["amount"] for e in period_entries if e["type"] == "disburse")
+    # 跟 Deposit/Withdraw 同一套口径（净额，扣手续费、含冲正）
+    deposit_totals = get_today_totals(chat_id, tz)
+    disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
+    live_in = sum(deposit_totals.values())
+    live_out = -sum(disburse_totals.values())
 
     return round(base_in + live_in, 4), round(base_out + live_out, 4)
 

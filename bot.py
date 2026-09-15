@@ -1,7 +1,10 @@
 import asyncio
+import html
 import json
+import logging
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -12,7 +15,26 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
+# ---------- 日志配置 ----------
+# 用 logging 而不是 print：logging.StreamHandler 每条记录都会立即 flush，
+# 不会像 print 那样被 Docker/管道缓冲区攒住导致 `docker logs` 看不到最新内容。
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ledgerbot")
+# python-telegram-bot 内部日志很啰嗦，降到 WARNING，避免刷屏掩盖自己的日志
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.INFO)
+
+try:
+    TOKEN = os.environ["BOT_TOKEN"]
+except KeyError:
+    logger.critical("❌ 未找到环境变量 BOT_TOKEN，Bot 无法启动。请检查 .env / docker run --env-file 是否正确传入。")
+    raise
 
 ADMIN_USERNAMES = {"IgAccJohn", "Dragonball77", "MrK6776", "react249", "jiang9546"}
 
@@ -29,6 +51,7 @@ LEDGER_CLEAR_SNAPSHOT_FILE = os.path.join(_data_dir, "ledger_clear_snapshot.json
 OPERATORS_FILE = os.path.join(_data_dir, "operators.json")
 ADDRESS_LOG_FILE = os.path.join(_data_dir, "usdt_addresses.json")
 MY_ADDRESS_FILE = os.path.join(_data_dir, "my_address.json")
+GLOBAL_BILL_ARCHIVE_FILE = os.path.join(_data_dir, "global_bill_archive.json")
 
 DEFAULT_LEDGER_SETTINGS = {
     "currency": "AUD",
@@ -39,6 +62,10 @@ DEFAULT_LEDGER_SETTINGS = {
     "out_fee": 0,
     "auto_cut_time": None,       # 例如 "04:00"，为 None 表示未开启自动日切
     "auto_cut_last_date": None,  # 记录最近一次自动日切的日期，防止同一天重复触发
+    "last_close_date": None,     # 记录最近一次结算日期（不分手动「日切」还是自动日切），用于全局账单判断已结算/未结算
+    "day_totals_date": None,     # day_in_total/day_out_total 对应的日期
+    "day_in_total": 0.0,         # 当天累计总进金额（跨多次日切也不清零，只在日期变化时重置）
+    "day_out_total": 0.0,        # 当天累计总出金额（跨多次日切也不清零，只在日期变化时重置）
     "hide_currency": False,
 }
 
@@ -54,9 +81,11 @@ RE_SET_OUT_FEE = re.compile(r"^设置OUT费率\s*(-?\d+(?:\.\d+)?)$", re.IGNOREC
 RE_SET_PERIOD_LABEL = re.compile(r"^设[置疑定]日期\s*(\d{4}-\d{2}-\d{2})$")
 RE_VIEW_LEDGER_BILL = re.compile(r"^账单$")
 RE_CLOSE_LEDGER = re.compile(r"^(?:结束账单|日切)$")
+RE_GLOBAL_BILL = re.compile(r"^(?:全局账单|结算单|总结账单)\s*(\d{1,2}-\d{1,2})?$")
 RE_SET_AUTO_CUT_TIME = re.compile(r"^设[置疑定]日切\s*(\d{1,4})(?::(\d{1,2}))?$")
 RE_CANCEL_AUTO_CUT = re.compile(r"^(?:取消日切|取消自动日切|关闭日切)$")
 RE_VIEW_AUTO_CUT = re.compile(r"^(?:日切时间|查看日切时间|查看日切)$")
+RE_RESET_AUTO_CUT = re.compile(r"^(?:重置日切|重置日切标记|测试日切)$")
 RE_LEDGER_ENTRY = re.compile(r"^([+-])\s*(\d+(?:\.\d+)?)\s*(.*)$", re.DOTALL)
 RE_LEDGER_ENTRY_TAGGED = re.compile(r"^([^\s+-]+)\s*([+-])\s*(\d+(?:\.\d+)?)\s*(.*)$", re.DOTALL)
 RE_LEDGER_DISBURSE = re.compile(r"^下发\s*([+-])?\s*(\d+(?:\.\d+)?)\s*(?:手续\s*(\d+(?:\.\d+)?)\s*)?(.*)$", re.DOTALL)
@@ -517,6 +546,10 @@ async def handle_usdt_addresses(update: Update, context: ContextTypes.DEFAULT_TY
                 "count": 1,
             }
             changed = True
+            await update.message.reply_text(
+                f"⚠️ 新地址首次出现：<code>{addr}</code>",
+                parse_mode="HTML",
+            )
         else:
             record["count"] = record.get("count", 1) + 1
             changed = True
@@ -621,6 +654,203 @@ def get_today_disburse(chat_id, tz):
     return items, net_totals
 
 
+# ---------- 全局账单（跨群汇总，仅查看不结算）----------
+
+def get_all_ledger_chat_ids():
+    """所有出现过账单数据的群 chat_id（设置或流水任一存在即算），去重排序。"""
+    settings_ids = set(load_ledger_settings().keys())
+    entries_ids = set(load_ledger_entries().keys())
+    all_ids = settings_ids | entries_ids
+    return sorted(all_ids, key=lambda x: int(x))
+
+
+def load_global_archive():
+    return load_json(GLOBAL_BILL_ARCHIVE_FILE, {})
+
+
+def save_global_archive(data):
+    save_json(GLOBAL_BILL_ARCHIVE_FILE, data)
+
+
+def record_global_archive(chat_id, date_str, settlement, total_in_amount, total_out_amount, total_count, currency):
+    """在「日切/结束账单」（不论手动还是自动）发生时调用，把这次结算按（群, 真实日历日期）累加进归档。
+    同一天同一个群可能会日切多次，做累加而不是覆盖，这样当天的归档数字才是完整的。"""
+    data = load_global_archive()
+    chat_key = str(chat_id)
+    chat_archive = data.setdefault(chat_key, {})
+    day = chat_archive.get(date_str, {
+        "settlement": 0.0, "total_in_amount": 0.0, "total_out_amount": 0.0,
+        "total_count": 0, "currency": currency,
+    })
+    day["settlement"] = round(day.get("settlement", 0.0) + settlement, 4)
+    day["total_in_amount"] = round(day.get("total_in_amount", 0.0) + total_in_amount, 4)
+    day["total_out_amount"] = round(day.get("total_out_amount", 0.0) + total_out_amount, 4)
+    day["total_count"] = day.get("total_count", 0) + total_count
+    day["currency"] = currency
+    chat_archive[date_str] = day
+    data[chat_key] = chat_archive
+    save_global_archive(data)
+
+
+async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, date_str: str) -> str:
+    """查某个指定日期（YYYY-MM-DD）的全局账单，两种数据来源会合并显示：
+    1）已归档：该群历史上某次日切时，结算的正好是这个日期（已结算）；
+    2）还没日切：该群当前账期（账期日期）正好就是这个日期，显示实时数据（未结算，跟正常「全局账单」的数据来源一样）。
+    两种情况都可能同时命中同一个群（比如当天已经日切过一次、之后又开了同一天的新账期），此时两部分金额会相加。
+    两种都没有的群不会出现在列表里。"""
+    archive = load_global_archive()
+    group_lines = []
+    total_in = 0.0
+    total_out = 0.0
+    total_txn_count = 0
+    count_groups = 0
+
+    for chat_id_str in get_all_ledger_chat_ids():
+        chat_id = int(chat_id_str)
+        tz = get_ledger_tz(chat_id)
+
+        archived_day = archive.get(chat_id_str, {}).get(date_str)
+        is_current_period = get_period_label(chat_id, tz) == date_str
+        if not archived_day and not is_current_period:
+            continue
+
+        settlement = 0.0
+        in_amount = 0.0
+        out_amount = 0.0
+        count = 0
+        status_parts = []
+
+        if archived_day:
+            settlement += archived_day.get("settlement", 0.0)
+            in_amount += archived_day.get("total_in_amount", 0.0)
+            out_amount += archived_day.get("total_out_amount", 0.0)
+            count += archived_day.get("total_count", 0)
+            status_parts.append("已结算")
+
+        if is_current_period:
+            deposit_totals = get_today_totals(chat_id, tz)
+            disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
+            period_entries = _period_entries(chat_id)
+            settlement += round(sum(deposit_totals.values()) + sum(disburse_totals.values()), 4)
+            in_amount += round(sum(e["amount"] for e in period_entries if e["type"] == "in"), 4)
+            out_amount += round(sum(e["amount"] for e in disburse_items), 4)
+            count += len(period_entries)
+            status_parts.append("未结算")
+
+        settlement = round(settlement, 4)
+        in_amount = round(in_amount, 4)
+        out_amount = round(out_amount, 4)
+
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            name = chat.title or chat.full_name or str(chat_id)
+        except Exception:
+            name = str(chat_id)
+        name = html.escape(name)
+
+        status = "+".join(status_parts)
+        group_lines.append(f"{name} {status}：{_fmt_num(settlement)}")
+        total_in += in_amount
+        total_out += out_amount
+        total_txn_count += count
+        count_groups += 1
+
+    total_in = round(total_in, 4)
+    total_out = round(total_out, 4)
+
+    group_block = "\n".join(group_lines) if group_lines else "（该日期暂无任何群的数据）"
+    lines = [f"📅 {date_str}", "", f"<blockquote>{group_block}</blockquote>", ""]
+    lines.append(f"共计群数：{count_groups}")
+    lines.append(f"笔数：{total_txn_count}")
+    lines.append(f"总进金额：{_fmt_num(total_in)}")
+    lines.append(f"总出金额：{_fmt_num(total_out)}")
+
+    return "\n".join(lines)
+
+
+async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_tz) -> str:
+    """遍历所有群，取各群当前账期的 Settlement（未结算金额，跟账单里显示的一致），只查看不清空。
+    如果这个群今天（自然日）已经结算过（不分手动「日切」还是自动日切），显示「已结算」；否则显示「未结算」。
+    同时汇总所有群的笔数（记一笔+下发总笔数）、总进金额（"+"记一笔原始金额相加）、
+    总出金额（下发原始金额相加，不含"-"记一笔）。整体包在 <blockquote> 里，点一下气泡就能整段复制。"""
+    group_lines = []
+    total_in = 0.0
+    total_out = 0.0
+    total_txn_count = 0
+    count_groups = 0
+
+    for chat_id_str in get_all_ledger_chat_ids():
+        chat_id = int(chat_id_str)
+        tz = get_ledger_tz(chat_id)
+        settings = get_group_ledger_settings(chat_id)
+        deposit_totals = get_today_totals(chat_id, tz)
+        disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
+
+        settlement = round(sum(deposit_totals.values()) + sum(disburse_totals.values()), 4)
+
+        period_entries = _period_entries(chat_id)
+        group_in, group_out = get_today_group_in_out(chat_id, tz)
+        total_in += group_in
+        total_out += group_out
+        total_txn_count += len(period_entries)
+
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        is_settled = settings.get("last_close_date") == today_str
+        status = "已结算" if is_settled else "未结算"
+
+        try:
+            chat = await context.bot.get_chat(chat_id)
+            name = chat.title or chat.full_name or str(chat_id)
+        except Exception:
+            name = str(chat_id)
+        name = html.escape(name)
+
+        group_lines.append(f"{name} {status}：{_fmt_num(settlement)}")
+        count_groups += 1
+
+    total_in = round(total_in, 4)
+    total_out = round(total_out, 4)
+
+    group_block = "\n".join(group_lines) if group_lines else "（暂无任何群有账单记录）"
+    header_date = datetime.now(header_tz).strftime("%m-%d")
+    lines = [f"📅 {header_date}", "", f"<blockquote>{group_block}</blockquote>", ""]
+    lines.append(f"共计群数：{count_groups}")
+    lines.append(f"笔数：{total_txn_count}")
+    lines.append(f"总进金额：{_fmt_num(total_in)}")
+    lines.append(f"总出金额：{_fmt_num(total_out)}")
+
+    return "\n".join(lines)
+
+
+async def try_handle_global_bill(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """匹配「全局账单」/「独立日切账单」：汇总 Bot 所在每个群的未结算金额，只查看不清空、不日切。
+    如果带了 MM-DD 日期后缀（例如「全局账单09-16」），则改为查该日期（今年）的数据：
+    该日期已经日切归档过的群显示「已结算」，当前账期日期正好是这一天但还没日切的群显示「未结算」，
+    两者都命中会相加；两者都没有的群不出现在列表里。"""
+    m = RE_GLOBAL_BILL.match(text)
+    if not m:
+        return False
+    if not is_operator(update.effective_user):
+        await update.message.reply_text("只有管理员/操作员能查看全局账单")
+        return True
+    chat_id = update.effective_chat.id
+    date_part = m.group(1)
+    if date_part:
+        month_str, day_str = date_part.split("-")
+        try:
+            month, day = int(month_str), int(day_str)
+            year = datetime.now(get_ledger_tz(chat_id)).year
+            date_str = datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text("日期不对，格式是「全局账单09-16」这样（月-日）")
+            return True
+        text_out = await build_global_bill_for_date_text(context, date_str)
+    else:
+        text_out = await build_global_bill_text(context, get_ledger_tz(chat_id))
+    await update.message.reply_text(text_out, parse_mode="HTML")
+    return True
+
+
 # ---------- 清空 / 结算 ----------
 
 def clear_ledger_today(chat_id):
@@ -662,11 +892,18 @@ def undo_clear_ledger_today(chat_id):
 
 
 def close_ledger_day(chat_id):
-    """结算当前账期的 GrandTotal，结转到下一账期（单一币种，以当前设置币种为准），账期日期+1。"""
+    """结算当前账期的 GrandTotal，结转到下一账期（单一币种，以当前设置币种为准），账期日期+1。
+    同时统计本账期的总单数（记一笔 + 下发）、总进金额（"+"记一笔原始金额合计）、
+    总出金额（下发原始金额合计，不含"-"记一笔）。"""
     settings = get_group_ledger_settings(chat_id)
     tz = get_ledger_tz(chat_id)
     deposit_totals = get_today_totals(chat_id, tz)
-    _, disburse_totals = get_today_disburse(chat_id, tz)
+    disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
+
+    period_entries = _period_entries(chat_id)
+    total_count = len(period_entries)
+    total_in_amount = round(sum(e["amount"] for e in period_entries if e["type"] == "in"), 4)
+    total_out_amount = round(sum(e["amount"] for e in disburse_items), 4)
 
     label = get_period_label(chat_id, tz)
 
@@ -682,24 +919,79 @@ def close_ledger_day(chat_id):
         next_label = label
 
     settings["period_label"] = next_label
+    today_close_str = datetime.now(tz).strftime("%Y-%m-%d")
+    if settings.get("day_totals_date") != today_close_str:
+        settings["day_in_total"] = 0.0
+        settings["day_out_total"] = 0.0
+        settings["day_totals_date"] = today_close_str
+    settings["day_in_total"] = round(settings.get("day_in_total", 0.0) + total_in_amount, 4)
+    settings["day_out_total"] = round(settings.get("day_out_total", 0.0) + total_out_amount, 4)
+    settings["last_close_date"] = today_close_str
     all_s = load_ledger_settings()
     all_s[str(chat_id)] = settings
     save_ledger_settings(all_s)
+
+    # 归档：按「账期标签」（比如通过「设定日期」预设的日期）记录这次结算，而不是真实日历日期——
+    # 这样即使提前把账期设成未来的日期再结算，「全局账单MM-DD」按这个日期也能查得到，跟实时查询的口径一致
+    record_global_archive(chat_id, label, total_grand, total_in_amount, total_out_amount, total_count, cur)
 
     all_entries = load_ledger_entries()
     all_entries[str(chat_id)] = []
     save_ledger_entries(all_entries)
 
-    return grand_totals, next_label
+    stats = {
+        "total_count": total_count,
+        "total_in_amount": total_in_amount,
+        "total_out_amount": total_out_amount,
+    }
+    return grand_totals, next_label, stats
+
+
+def get_today_group_in_out(chat_id, tz):
+    """某群「今天」的累计总进/总出金额：= 今天已经日切掉的部分（day_in_total/day_out_total）
+    + 当前账期里还没结算的部分（实时统计）。这样已结算的群也能看到今天的总进/总出，不会归零。"""
+    settings = get_group_ledger_settings(chat_id)
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    if settings.get("day_totals_date") == today_str:
+        base_in = settings.get("day_in_total", 0.0)
+        base_out = settings.get("day_out_total", 0.0)
+    else:
+        base_in = 0.0
+        base_out = 0.0
+
+    period_entries = _period_entries(chat_id)
+    live_in = sum(e["amount"] for e in period_entries if e["type"] == "in")
+    live_out = sum(e["amount"] for e in period_entries if e["type"] == "disburse")
+
+    return round(base_in + live_in, 4), round(base_out + live_out, 4)
 
 
 # ---------- 自动日切 ----------
+
+_auto_cut_tick_count = 0
 
 async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
     """后台定时任务：每隔一段时间检查一次所有群，看是否到了该群设置的自动日切时间。
     到点就自动执行一次「日切」（等价于手动发「日切」），并在群里发送结果。
     用 auto_cut_last_date 记录今天是否已经切过，防止同一分钟内被多次触发，也防止重启后重复切。"""
+    global _auto_cut_tick_count
+    _auto_cut_tick_count += 1
+
     all_settings = load_ledger_settings()
+
+    # 心跳日志：每 120 轮（interval=5s 时约 10 分钟一次）打一条，证明任务本身还活着，
+    # 不需要等到真正触发日切才有日志。如果这条日志完全不出现，说明 job_queue 根本没跑起来。
+    if _auto_cut_tick_count % 120 == 1:
+        configured = [
+            (cid, dict(DEFAULT_LEDGER_SETTINGS, **raw).get("auto_cut_time"))
+            for cid, raw in all_settings.items()
+            if dict(DEFAULT_LEDGER_SETTINGS, **raw).get("auto_cut_time")
+        ]
+        logger.info(
+            "[auto_cut] 心跳 #%d，已配置自动日切的群共 %d 个：%s",
+            _auto_cut_tick_count, len(configured), configured,
+        )
+
     if not all_settings:
         return
 
@@ -714,6 +1006,7 @@ async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             chat_id = int(chat_id_str)
         except ValueError:
+            logger.warning("[auto_cut] 群 ID 解析失败，跳过：%r", chat_id_str)
             continue
 
         tz = timezone(timedelta(hours=settings.get("tz_offset", 8)))
@@ -725,28 +1018,33 @@ async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
         if settings.get("auto_cut_last_date") == today_str:
             continue  # 今天已经切过，跳过
 
-        # 先标记，避免同一轮/并发里重复触发
-        set_group_ledger_setting(chat_id, "auto_cut_last_date", today_str)
+        logger.info("[auto_cut] 群 %s 到达设定时间 %s，开始自动日切...", chat_id, cut_time)
 
+        # 修复：先成功执行结算，再更新 auto_cut_last_date 标记，确保失败时可重试
         try:
-            grand_totals, next_label = close_ledger_day(chat_id)
-        except Exception as e:
-            print(f"[auto_cut] 群 {chat_id} 自动日切失败：{e}")
+            grand_totals, next_label, stats = close_ledger_day(chat_id)
+        except Exception:
+            logger.exception("[auto_cut] 群 %s 自动日切失败（结算阶段）", chat_id)
             continue
 
+        set_group_ledger_setting(chat_id, "auto_cut_last_date", today_str)
+
         gt_str = " | ".join([f"{cur}: {_fmt_num(val)}" for cur, val in grand_totals.items()])
+        logger.info("[auto_cut] 群 %s 日切成功，结转总额=%s，新账期=%s", chat_id, gt_str, next_label)
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"⏰ 已自动日切（{cut_time}）！\n\n"
-                    f"📊 <b>结转总额</b>：<code>{gt_str}</code>\n"
-                    f"📅 <b>新账期</b>：{next_label}"
+                    f"📅 <b>新账期</b>：{next_label}\n"
+                    f"🧾 <b>总单数</b>：{stats['total_count']} 笔\n"
+                    f"⬆️ <b>总进金额</b>：{_fmt_num(stats['total_in_amount'])}\n"
+                    f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}"
                 ),
                 parse_mode="HTML",
             )
-        except Exception as e:
-            print(f"[auto_cut] 群 {chat_id} 发送自动日切消息失败：{e}")
+        except Exception:
+            logger.exception("[auto_cut] 群 %s 发送自动日切消息失败（结算本身已成功，只是通知没发出去）", chat_id)
 
 
 # ---------- 格式化 ----------
@@ -1099,12 +1397,14 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
         return True
 
     if RE_CLOSE_LEDGER.match(text):
-        grand_totals, next_label = close_ledger_day(chat_id)
+        grand_totals, next_label, stats = close_ledger_day(chat_id)
         gt_str = " | ".join([f"{cur}: {_fmt_num(val)}" for cur, val in grand_totals.items()])
         await update.message.reply_text(
             f"✅ 账单已结束！\n\n"
-            f"📊 <b>结转总额</b>：<code>{gt_str}</code>\n"
-            f"📅 <b>新账期</b>：{next_label}",
+            f"📅 <b>新账期</b>：{next_label}\n"
+            f"🧾 <b>总单数</b>：{stats['total_count']} 笔\n"
+            f"⬆️ <b>总进金额</b>：{_fmt_num(stats['total_in_amount'])}\n"
+            f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}",
             parse_mode="HTML"
         )
         return True
@@ -1138,11 +1438,8 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
             return True
         cut_time = f"{hour:02d}:{minute:02d}"
         set_group_ledger_setting(chat_id, "auto_cut_time", cut_time)
-        # 今天如果已经过了这个时间点，标记成"今天已切过"，避免设置完马上误触发一次
-        tz = get_ledger_tz(chat_id)
-        now = datetime.now(tz)
-        if now.strftime("%H:%M") >= cut_time:
-            set_group_ledger_setting(chat_id, "auto_cut_last_date", now.strftime("%Y-%m-%d"))
+        set_group_ledger_setting(chat_id, "auto_cut_last_date", None)
+        # 修复：移除了原本设置时自动预判并将 auto_cut_last_date 设为当天的逻辑，避免污染状态
         tz_offset = get_group_ledger_settings(chat_id)["tz_offset"]
         offset_str = f"+{tz_offset:g}" if tz_offset >= 0 else f"{tz_offset:g}"
         await update.message.reply_text(
@@ -1165,6 +1462,17 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
             await update.message.reply_text(f"⏰ 当前自动日切时间：每天 {cut_time}")
         else:
             await update.message.reply_text("还没设置自动日切，发「设置日切 22」开启")
+        return True
+
+    if RE_RESET_AUTO_CUT.match(text):
+        if not is_operator(update.effective_user):
+            await update.message.reply_text("只有管理员能重置日切标记")
+            return True
+        set_group_ledger_setting(chat_id, "auto_cut_last_date", None)
+        await update.message.reply_text(
+            "✅ 已重置「今天是否已日切」的标记\n"
+            "接下来把日切时间设为快到的时间点（比如现在是 15:20，就发「设置日切 1521」），到点就会立刻再触发一次，方便测试"
+        )
         return True
 
     return False
@@ -1217,6 +1525,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # USDT 地址查重 + TRON 钱包信息卡片：群里任何人发的消息都检测，不限操作员
     await handle_usdt_addresses(update, context, text)
 
+    if await try_handle_global_bill(update, context, text):
+        return
+
     if await try_handle_ledger_settings(update, context, text):
         return
 
@@ -1258,6 +1569,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "结束账单 / 日切 / 清空账单 / 撤销清空账单\n"
         "自动日切：发「设置日切 22」，每天22点自动结束账单（也支持「设置日切 2230」「设置日切 22:30」）\n"
         "查看/取消自动日切：发「日切时间」/「取消日切」\n"
+        "全局账单：发「全局账单」或「独立日切账单」，汇总 Bot 所在每个群当前未结算的金额（只查看不清空）\n"
+        "按日期查：发「全局账单09-16」这样带日期（月-日，今年），查那天各群的数据——"
+        "已经日切过的显示已结算，账期还开着但日期对得上的显示未结算\n"
         "撤销某笔：回复那条记账消息发「撤销」，恢复发「撤销恢复」\n\n"
         "USDT地址查重：群里谁发的消息里带地址（TRC20/ERC20）都会自动检测，"  
         "如果这个地址之前出现过，会提示是谁第一次发的、什么时候发的\n"
@@ -1288,10 +1602,14 @@ app.add_handler(CallbackQueryHandler(listoperators_noop_cb, pattern=r"^op:noop$"
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 if app.job_queue is not None:
-    app.job_queue.run_repeating(auto_cut_job, interval=30, first=10)
+    app.job_queue.run_repeating(auto_cut_job, interval=5, first=5)
+    logger.info("✅ 自动日切定时任务已注册（每5秒检查一次，启动5秒后首次执行）")
 else:
-    print("⚠️ JobQueue 不可用，自动日切功能不会生效。请运行："
-          "pip install \"python-telegram-bot[job-queue]\"")
+    logger.critical(
+        "❌ JobQueue 不可用，自动日切功能不会生效！"
+        "请确认镜像里装的是 python-telegram-bot[job-queue]（而不是不带 extras 的版本），"
+        "并且 APScheduler 已正确安装。"
+    )
 
-print("记账机器人已启动，正在监听消息...")
+logger.info("记账机器人已启动，正在监听消息...")
 app.run_polling(drop_pending_updates=True)

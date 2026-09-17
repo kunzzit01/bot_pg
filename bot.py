@@ -694,10 +694,10 @@ def record_global_archive(chat_id, date_str, settlement, total_in_amount, total_
 
 async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, date_str: str) -> str:
     """查某个指定日期（YYYY-MM-DD）的全局账单，两种数据来源会合并显示：
-    1）已归档：该群历史上某次日切时，结算的正好是这个日期（已结算）；
-    2）还没日切：该群当前账期（账期日期）正好就是这个日期，显示实时数据（未结算，跟正常「全局账单」的数据来源一样）。
+    1）已归档：该群历史上某次日切时，结算的正好是这个日期；
+    2）还没日切：该群当前账期（账期日期）正好就是这个日期，显示实时数据（跟正常「全局账单」的数据来源一样）。
     两种情况都可能同时命中同一个群（比如当天已经日切过一次、之后又开了同一天的新账期），此时两部分金额会相加。
-    两种都没有的群不会出现在列表里。"""
+    两种都没有的群不会出现在列表里。每个群只显示进/出金额，不区分已结算/未结算。"""
     archive = load_global_archive()
     group_lines = []
     total_in = 0.0
@@ -714,30 +714,23 @@ async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, da
         if not archived_day and not is_current_period:
             continue
 
-        settlement = 0.0
         in_amount = 0.0
         out_amount = 0.0
         count = 0
-        status_parts = []
 
         if archived_day:
-            settlement += archived_day.get("settlement", 0.0)
             in_amount += archived_day.get("total_in_amount", 0.0)
             out_amount += archived_day.get("total_out_amount", 0.0)
             count += archived_day.get("total_count", 0)
-            status_parts.append("已结算")
 
         if is_current_period:
             deposit_totals = get_today_totals(chat_id, tz)
             disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
             period_entries = _period_entries(chat_id)
-            settlement += round(sum(deposit_totals.values()) + sum(disburse_totals.values()), 4)
             in_amount += round(sum(deposit_totals.values()), 4)
             out_amount += round(-sum(disburse_totals.values()), 4)
             count += len(period_entries)
-            status_parts.append("未结算")
 
-        settlement = round(settlement, 4)
         in_amount = round(in_amount, 4)
         out_amount = round(out_amount, 4)
 
@@ -748,8 +741,7 @@ async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, da
             name = str(chat_id)
         name = html.escape(name)
 
-        status = "+".join(status_parts)
-        group_lines.append(f"{name} {status}：{_fmt_num(settlement)}")
+        group_lines.append(f"{name} 进：{_fmt_num(in_amount)} 出：{_fmt_num(out_amount)}")
         total_in += in_amount
         total_out += out_amount
         total_txn_count += count
@@ -760,18 +752,19 @@ async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, da
 
     group_block = "\n".join(group_lines) if group_lines else "（该日期暂无任何群的数据）"
     lines = [f"📅 {date_str}", "", f"<blockquote>{group_block}</blockquote>", ""]
-    lines.append(f"共计群数：{count_groups}")
-    lines.append(f"笔数：{total_txn_count}")
-    lines.append(f"总进金额：{_fmt_num(total_in)}")
-    lines.append(f"总出金额：{_fmt_num(total_out)}")
-    lines.append(f"GrandTotal：{_fmt_num(round(total_in - total_out, 4))}")
+    lines.append(f"<b>共计群数</b>：{count_groups}")
+    lines.append(f"<b>笔数</b>：{total_txn_count}")
+    lines.append(f"<b>总进金额</b>：{_fmt_num(total_in)}")
+    lines.append(f"<b>总出金额</b>：{_fmt_num(total_out)}")
+    lines.append(f"<b>GrandTotal</b>：{_fmt_num(round(total_in - total_out, 4))}")
+
     return "\n".join(lines)
 
 
 async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_chat_id) -> str:
     """遍历所有群，只保留「当前账期日期」正好等于目标日期（= 发指令这个群当前的账期日期）的群，
-    取这些群「今天」（自然日）的累计总进/总出金额（= 已日切归档部分 + 当前账期未结算部分，
-    跟 get_today_group_in_out 口径一致），只查看不清空、不涉及日切状态，不区分已结算/未结算。
+    取这些群当前账期（还没日切、实时未结算）的进/出金额（get_today_totals / get_today_disburse，
+    跟「全局账单MM-DD」的 is_current_period 分支同一套口径，避免跨账期的 day_in_total 累计混进来）。
     账期日期不是目标日期的群（比如还没日切、停在前一天）不会出现在列表里，也不计入汇总。
     表头日期跟随发指令这个群「当前账期」的日期（日切后立刻变成新账期日期，不用等自然日真的翻篇）。
     同时汇总所有群的笔数（记一笔+下发总笔数）、总进金额、总出金额。整体包在 <blockquote> 里，点一下气泡就能整段复制。"""
@@ -791,8 +784,11 @@ async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_chat
         if get_period_label(chat_id, tz) != target_date:
             continue
 
+        deposit_totals = get_today_totals(chat_id, tz)
+        disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
         period_entries = _period_entries(chat_id)
-        group_in, group_out = get_today_group_in_out(chat_id, tz)
+        group_in = round(sum(deposit_totals.values()), 4)
+        group_out = round(-sum(disburse_totals.values()), 4)
         total_in += group_in
         total_out += group_out
         total_txn_count += len(period_entries)
@@ -813,11 +809,12 @@ async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_chat
     group_block = "\n".join(group_lines) if group_lines else "（暂无任何群有账单记录）"
     header_date = target_date[5:] if len(target_date) == 10 else target_date
     lines = [f"📅 {header_date}", "", f"<blockquote>{group_block}</blockquote>", ""]
-    lines.append(f"共计群数：{count_groups}")
-    lines.append(f"笔数：{total_txn_count}")
-    lines.append(f"总进金额：{_fmt_num(total_in)}")
-    lines.append(f"总出金额：{_fmt_num(total_out)}")
-    lines.append(f"GrandTotal：{_fmt_num(round(total_in - total_out, 4))}")
+    lines.append(f"<b>共计群数</b>：{count_groups}")
+    lines.append(f"<b>笔数</b>：{total_txn_count}")
+    lines.append(f"<b>总进金额</b>：{_fmt_num(total_in)}")
+    lines.append(f"<b>总出金额</b>：{_fmt_num(total_out)}")
+    lines.append(f"<b>GrandTotal</b>：{_fmt_num(round(total_in - total_out, 4))}")
+
     return "\n".join(lines)
 
 
@@ -1412,6 +1409,7 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
             f"⬆️ <b>总进金额</b>：{_fmt_num(stats['total_in_amount'])}\n"
             f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}\n"
             f"💰 <b>GrandTotal</b>：{gt_str}",
+            
             parse_mode="HTML"
         )
         return True
@@ -1576,9 +1574,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "结束账单 / 日切 / 清空账单 / 撤销清空账单\n"
         "自动日切：发「设置日切 22」，每天22点自动结束账单（也支持「设置日切 2230」「设置日切 22:30」）\n"
         "查看/取消自动日切：发「日切时间」/「取消日切」\n"
-        "全局账单：发「全局账单」或「独立日切账单」，汇总 Bot 所在每个群当前未结算的金额（只查看不清空）\n"
-        "按日期查：发「全局账单09-16」这样带日期（月-日，今年），查那天各群的数据——"
-        "已经日切过的显示已结算，账期还开着但日期对得上的显示未结算\n"
+        "全局账单：发「全局账单」或「独立日切账单」，汇总 Bot 所在每个群当前账期（跟你发指令这个群账期日期一样）的进/出金额，及 GrandTotal（只查看不清空）\n"
+        "按日期查：发「全局账单09-16」这样带日期（月-日，今年），查那天各群的进/出数据（同样带 GrandTotal）\n"
         "撤销某笔：回复那条记账消息发「撤销」，恢复发「撤销恢复」\n\n"
         "USDT地址查重：群里谁发的消息里带地址（TRC20/ERC20）都会自动检测，"  
         "如果这个地址之前出现过，会提示是谁第一次发的、什么时候发的\n"

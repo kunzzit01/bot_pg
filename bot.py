@@ -36,7 +36,7 @@ except KeyError:
     logger.critical("❌ 未找到环境变量 BOT_TOKEN，Bot 无法启动。请检查 .env / docker run --env-file 是否正确传入。")
     raise
 
-ADMIN_USERNAMES = {"IgAccJohn", "Dragonball77", "MrK6776", "react249", "jiang9546"}
+ADMIN_USERNAMES = {"IgAccJohn", "Safepaymark", "MrK6776", "react249", "jiang9546", "bestmario999", "Ninety13"}
 
 PAGE_SIZE = 10
 
@@ -79,7 +79,7 @@ RE_SET_TIMEZONE = re.compile(r"^设[置疑定]时区\s*([+-]?\d+(?:\.\d+)?)$")
 RE_SET_IN_FEE = re.compile(r"^设置IN费率\s*(-?\d+(?:\.\d+)?)$", re.IGNORECASE)
 RE_SET_OUT_FEE = re.compile(r"^设置OUT费率\s*(-?\d+(?:\.\d+)?)$", re.IGNORECASE)
 RE_SET_PERIOD_LABEL = re.compile(r"^设[置疑定]日期\s*(\d{4}-\d{2}-\d{2})$")
-RE_VIEW_LEDGER_BILL = re.compile(r"^账单$")
+RE_VIEW_LEDGER_BILL = re.compile(r"^(账单|\+|查账单)$")
 RE_CLOSE_LEDGER = re.compile(r"^(?:结束账单|日切)$")
 RE_GLOBAL_BILL = re.compile(r"^(?:全局账单|结算单|总结账单)\s*(\d{1,2}-\d{1,2})?$")
 RE_SET_AUTO_CUT_TIME = re.compile(r"^设[置疑定]日切\s*(\d{1,4})(?::(\d{1,2}))?$")
@@ -764,15 +764,20 @@ async def build_global_bill_for_date_text(context: ContextTypes.DEFAULT_TYPE, da
     lines.append(f"笔数：{total_txn_count}")
     lines.append(f"总进金额：{_fmt_num(total_in)}")
     lines.append(f"总出金额：{_fmt_num(total_out)}")
-
+    lines.append(f"GrandTotal：{_fmt_num(round(total_in - total_out, 4))}")
     return "\n".join(lines)
 
 
-async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_tz) -> str:
-    """遍历所有群，取各群当前账期的 Settlement（未结算金额，跟账单里显示的一致），只查看不清空。
-    如果这个群今天（自然日）已经结算过（不分手动「日切」还是自动日切），显示「已结算」；否则显示「未结算」。
-    同时汇总所有群的笔数（记一笔+下发总笔数）、总进金额（"+"记一笔原始金额相加）、
-    总出金额（下发原始金额相加，不含"-"记一笔）。整体包在 <blockquote> 里，点一下气泡就能整段复制。"""
+async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_chat_id) -> str:
+    """遍历所有群，只保留「当前账期日期」正好等于目标日期（= 发指令这个群当前的账期日期）的群，
+    取这些群「今天」（自然日）的累计总进/总出金额（= 已日切归档部分 + 当前账期未结算部分，
+    跟 get_today_group_in_out 口径一致），只查看不清空、不涉及日切状态，不区分已结算/未结算。
+    账期日期不是目标日期的群（比如还没日切、停在前一天）不会出现在列表里，也不计入汇总。
+    表头日期跟随发指令这个群「当前账期」的日期（日切后立刻变成新账期日期，不用等自然日真的翻篇）。
+    同时汇总所有群的笔数（记一笔+下发总笔数）、总进金额、总出金额。整体包在 <blockquote> 里，点一下气泡就能整段复制。"""
+    header_tz = get_ledger_tz(header_chat_id)
+    target_date = get_period_label(header_chat_id, header_tz)
+
     group_lines = []
     total_in = 0.0
     total_out = 0.0
@@ -782,21 +787,15 @@ async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_tz) 
     for chat_id_str in get_all_ledger_chat_ids():
         chat_id = int(chat_id_str)
         tz = get_ledger_tz(chat_id)
-        settings = get_group_ledger_settings(chat_id)
-        deposit_totals = get_today_totals(chat_id, tz)
-        disburse_items, disburse_totals = get_today_disburse(chat_id, tz)
 
-        settlement = round(sum(deposit_totals.values()) + sum(disburse_totals.values()), 4)
+        if get_period_label(chat_id, tz) != target_date:
+            continue
 
         period_entries = _period_entries(chat_id)
         group_in, group_out = get_today_group_in_out(chat_id, tz)
         total_in += group_in
         total_out += group_out
         total_txn_count += len(period_entries)
-
-        today_str = datetime.now(tz).strftime("%Y-%m-%d")
-        is_settled = settings.get("last_close_date") == today_str
-        status = "已结算" if is_settled else "未结算"
 
         try:
             chat = await context.bot.get_chat(chat_id)
@@ -805,25 +804,26 @@ async def build_global_bill_text(context: ContextTypes.DEFAULT_TYPE, header_tz) 
             name = str(chat_id)
         name = html.escape(name)
 
-        group_lines.append(f"{name} {status}：{_fmt_num(settlement)}")
+        group_lines.append(f"{name} 进：{_fmt_num(group_in)} 出：{_fmt_num(group_out)}")
         count_groups += 1
 
     total_in = round(total_in, 4)
     total_out = round(total_out, 4)
 
     group_block = "\n".join(group_lines) if group_lines else "（暂无任何群有账单记录）"
-    header_date = datetime.now(header_tz).strftime("%m-%d")
+    header_date = target_date[5:] if len(target_date) == 10 else target_date
     lines = [f"📅 {header_date}", "", f"<blockquote>{group_block}</blockquote>", ""]
     lines.append(f"共计群数：{count_groups}")
     lines.append(f"笔数：{total_txn_count}")
     lines.append(f"总进金额：{_fmt_num(total_in)}")
     lines.append(f"总出金额：{_fmt_num(total_out)}")
-
+    lines.append(f"GrandTotal：{_fmt_num(round(total_in - total_out, 4))}")
     return "\n".join(lines)
 
 
 async def try_handle_global_bill(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
-    """匹配「全局账单」/「独立日切账单」：汇总 Bot 所在每个群的未结算金额，只查看不清空、不日切。
+    """匹配「全局账单」/「独立日切账单」：不带日期时，汇总 Bot 所在每个群「今天」的总进/总出金额，
+    只查看不清空、不日切，不区分已结算/未结算。
     如果带了 MM-DD 日期后缀（例如「全局账单09-16」），则改为查该日期（今年）的数据：
     该日期已经日切归档过的群显示「已结算」，当前账期日期正好是这一天但还没日切的群显示「未结算」，
     两者都命中会相加；两者都没有的群不出现在列表里。"""
@@ -846,7 +846,7 @@ async def try_handle_global_bill(update: Update, context: ContextTypes.DEFAULT_T
             return True
         text_out = await build_global_bill_for_date_text(context, date_str)
     else:
-        text_out = await build_global_bill_text(context, get_ledger_tz(chat_id))
+        text_out = await build_global_bill_text(context, chat_id)
     await update.message.reply_text(text_out, parse_mode="HTML")
     return True
 
@@ -1044,7 +1044,8 @@ async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
                     f"📅 <b>新账期</b>：{next_label}\n"
                     f"🧾 <b>总单数</b>：{stats['total_count']} 笔\n"
                     f"⬆️ <b>总进金额</b>：{_fmt_num(stats['total_in_amount'])}\n"
-                    f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}"
+                    f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}\n"
+                    f"💰 <b>GrandTotal</b>：{gt_str}"
                 ),
                 parse_mode="HTML",
             )
@@ -1409,7 +1410,8 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
             f"📅 <b>新账期</b>：{next_label}\n"
             f"🧾 <b>总单数</b>：{stats['total_count']} 笔\n"
             f"⬆️ <b>总进金额</b>：{_fmt_num(stats['total_in_amount'])}\n"
-            f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}",
+            f"⬇️ <b>总出金额</b>：{_fmt_num(stats['total_out_amount'])}\n"
+            f"💰 <b>GrandTotal</b>：{gt_str}",
             parse_mode="HTML"
         )
         return True

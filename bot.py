@@ -1031,7 +1031,7 @@ async def auto_cut_job(context: ContextTypes.DEFAULT_TYPE):
 
         set_group_ledger_setting(chat_id, "auto_cut_last_date", today_str)
 
-        gt_str = " | ".join([f"{cur}: {_fmt_num(val)}" for cur, val in grand_totals.items()])
+        gt_str = " | ".join([f"{_fmt_num(val)}" for cur, val in grand_totals.items()])
         logger.info("[auto_cut] 群 %s 日切成功，结转总额=%s，新账期=%s", chat_id, gt_str, next_label)
         try:
             await context.bot.send_message(
@@ -1401,7 +1401,7 @@ async def try_handle_ledger_settings(update: Update, context: ContextTypes.DEFAU
 
     if RE_CLOSE_LEDGER.match(text):
         grand_totals, next_label, stats = close_ledger_day(chat_id)
-        gt_str = " | ".join([f"{cur}: {_fmt_num(val)}" for cur, val in grand_totals.items()])
+        gt_str = " | ".join([f"{_fmt_num(val)}" for cur, val in grand_totals.items()])
         await update.message.reply_text(
             f"✅ 账单已结束！\n\n"
             f"📅 <b>新账期</b>：{next_label}\n"

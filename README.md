@@ -69,6 +69,17 @@ cd ~/newbot_pg1 && git pull && bash deploy/update.sh
 容器名与镜像名默认是 `newbot_pg1_container` / `newbot_pg1_image:latest`，需要改时用环境变量覆盖：
 `CONTAINER=别的名字 IMAGE=别的镜像:tag bash deploy/update.sh`。
 
+### 换 bot token
+
+token 只在服务器的 `.env` 里，不在 git 里 —— 所以换 token 必须连 `.env` 一起改，单独 `git pull` 是换不掉的：
+
+```bash
+cd ~/newbot_pg1 && BOT_TOKEN='BotFather 给的新token' bash deploy/update.sh
+```
+
+脚本会把 `.env` 里的 `BOT_TOKEN=` 那一行换成新值（其余行原样保留；没有 `.env` 就先从 `.env.example` 生成一份），
+然后照常 `git pull` → 构建镜像 → 重建容器，一次搞定。
+
 验证部署版本：
 
 ```bash
